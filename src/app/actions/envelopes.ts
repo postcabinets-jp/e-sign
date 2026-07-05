@@ -3,17 +3,30 @@
 import { revalidatePath } from 'next/cache'
 import { redirect } from 'next/navigation'
 import { createClient } from '@/lib/supabase/server'
+import {
+  createEnvelopeSchema,
+  sendEnvelopeSchema,
+  voidEnvelopeSchema,
+  addSignerSchema,
+  removeSignerSchema,
+} from '@/lib/validations'
 
 export async function createEnvelope(formData: FormData) {
+  const parsed = createEnvelopeSchema.safeParse({
+    title: formData.get('title'),
+    source_file_url: formData.get('source_file_url'),
+    template_id: formData.get('template_id') || null,
+    expires_at: formData.get('expires_at') || null,
+  })
+
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0].message }
+  }
+
   const supabase = await createClient()
 
   const { data: { user } } = await supabase.auth.getUser()
   if (!user) redirect('/login')
-
-  const title = formData.get('title') as string
-  const sourceFileUrl = formData.get('source_file_url') as string
-  const templateId = formData.get('template_id') as string | null
-  const expiresAt = formData.get('expires_at') as string | null
 
   // Get user's organization
   const { data: membership } = await supabase
@@ -31,10 +44,10 @@ export async function createEnvelope(formData: FormData) {
     .insert({
       organization_id: membership.organization_id,
       created_by: user.id,
-      title,
-      source_file_url: sourceFileUrl,
-      template_id: templateId || null,
-      expires_at: expiresAt || null,
+      title: parsed.data.title,
+      source_file_url: parsed.data.source_file_url,
+      template_id: parsed.data.template_id ?? null,
+      expires_at: parsed.data.expires_at ?? null,
       status: 'draft',
     })
     .select()
@@ -57,6 +70,12 @@ export async function createEnvelope(formData: FormData) {
 }
 
 export async function sendEnvelope(envelopeId: string) {
+  const parsed = sendEnvelopeSchema.safeParse({ envelopeId })
+
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0].message }
+  }
+
   const supabase = await createClient()
 
   const { data: { user } } = await supabase.auth.getUser()
@@ -66,7 +85,7 @@ export async function sendEnvelope(envelopeId: string) {
   const { data: envelope } = await supabase
     .from('envelopes')
     .select('*, signers(*)')
-    .eq('id', envelopeId)
+    .eq('id', parsed.data.envelopeId)
     .single()
 
   if (!envelope) {
@@ -84,7 +103,7 @@ export async function sendEnvelope(envelopeId: string) {
   const { error } = await supabase
     .from('envelopes')
     .update({ status: 'sent' })
-    .eq('id', envelopeId)
+    .eq('id', parsed.data.envelopeId)
 
   if (error) {
     return { error: error.message }
@@ -95,23 +114,29 @@ export async function sendEnvelope(envelopeId: string) {
   await supabase
     .from('signers')
     .update({ status: 'sent' })
-    .eq('envelope_id', envelopeId)
+    .eq('envelope_id', parsed.data.envelopeId)
     .eq('order_index', firstOrderIndex)
 
   await supabase.from('audit_events').insert({
-    envelope_id: envelopeId,
+    envelope_id: parsed.data.envelopeId,
     event_type: 'envelope_sent',
     actor_user_id: user.id,
     actor_email: user.email,
   })
 
-  revalidatePath(`/dashboard/envelopes/${envelopeId}`)
+  revalidatePath(`/dashboard/envelopes/${parsed.data.envelopeId}`)
   revalidatePath('/dashboard')
 
   return { success: true }
 }
 
 export async function voidEnvelope(envelopeId: string, reason: string) {
+  const parsed = voidEnvelopeSchema.safeParse({ envelopeId, reason })
+
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0].message }
+  }
+
   const supabase = await createClient()
 
   const { data: { user } } = await supabase.auth.getUser()
@@ -122,23 +147,23 @@ export async function voidEnvelope(envelopeId: string, reason: string) {
     .update({
       status: 'voided',
       voided_at: new Date().toISOString(),
-      void_reason: reason,
+      void_reason: parsed.data.reason,
     })
-    .eq('id', envelopeId)
+    .eq('id', parsed.data.envelopeId)
 
   if (error) {
     return { error: error.message }
   }
 
   await supabase.from('audit_events').insert({
-    envelope_id: envelopeId,
+    envelope_id: parsed.data.envelopeId,
     event_type: 'envelope_voided',
     actor_user_id: user.id,
     actor_email: user.email,
-    metadata: { reason },
+    metadata: { reason: parsed.data.reason },
   })
 
-  revalidatePath(`/dashboard/envelopes/${envelopeId}`)
+  revalidatePath(`/dashboard/envelopes/${parsed.data.envelopeId}`)
   revalidatePath('/dashboard')
 
   return { success: true }
@@ -150,6 +175,12 @@ export async function addSigner(envelopeId: string, signerData: {
   role?: string
   orderIndex: number
 }) {
+  const parsed = addSignerSchema.safeParse({ envelopeId, signerData })
+
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0].message }
+  }
+
   const supabase = await createClient()
 
   const { data: { user } } = await supabase.auth.getUser()
@@ -158,11 +189,11 @@ export async function addSigner(envelopeId: string, signerData: {
   const { data: signer, error } = await supabase
     .from('signers')
     .insert({
-      envelope_id: envelopeId,
-      name: signerData.name,
-      email: signerData.email,
-      role: signerData.role,
-      order_index: signerData.orderIndex,
+      envelope_id: parsed.data.envelopeId,
+      name: parsed.data.signerData.name,
+      email: parsed.data.signerData.email,
+      role: parsed.data.signerData.role,
+      order_index: parsed.data.signerData.orderIndex,
     })
     .select()
     .single()
@@ -171,11 +202,17 @@ export async function addSigner(envelopeId: string, signerData: {
     return { error: error.message }
   }
 
-  revalidatePath(`/dashboard/envelopes/${envelopeId}`)
+  revalidatePath(`/dashboard/envelopes/${parsed.data.envelopeId}`)
   return { signer }
 }
 
 export async function removeSigner(signerId: string, envelopeId: string) {
+  const parsed = removeSignerSchema.safeParse({ signerId, envelopeId })
+
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0].message }
+  }
+
   const supabase = await createClient()
 
   const { data: { user } } = await supabase.auth.getUser()
@@ -184,12 +221,12 @@ export async function removeSigner(signerId: string, envelopeId: string) {
   const { error } = await supabase
     .from('signers')
     .delete()
-    .eq('id', signerId)
+    .eq('id', parsed.data.signerId)
 
   if (error) {
     return { error: error.message }
   }
 
-  revalidatePath(`/dashboard/envelopes/${envelopeId}`)
+  revalidatePath(`/dashboard/envelopes/${parsed.data.envelopeId}`)
   return { success: true }
 }

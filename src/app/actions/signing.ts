@@ -4,8 +4,20 @@ import { revalidatePath } from 'next/cache'
 import { createClient } from '@/lib/supabase/server'
 import { createAdminClient } from '@/lib/supabase/server'
 import { headers } from 'next/headers'
+import {
+  getSignerByTokenSchema,
+  markSignerViewedSchema,
+  submitSignatureSchema,
+  declineSigningSchema,
+} from '@/lib/validations'
 
 export async function getSignerByToken(token: string) {
+  const parsed = getSignerByTokenSchema.safeParse({ token })
+
+  if (!parsed.success) {
+    return null
+  }
+
   const supabase = await createAdminClient()
 
   const { data: signer } = await supabase
@@ -17,20 +29,26 @@ export async function getSignerByToken(token: string) {
         signing_fields (*)
       )
     `)
-    .eq('signing_token', token)
+    .eq('signing_token', parsed.data.token)
     .single()
 
   return signer
 }
 
 export async function markSignerViewed(token: string) {
+  const parsed = markSignerViewedSchema.safeParse({ token })
+
+  if (!parsed.success) {
+    return
+  }
+
   const supabase = await createAdminClient()
   const headersList = await headers()
 
   const { data: signer } = await supabase
     .from('signers')
     .select('id, envelope_id, status, viewed_at')
-    .eq('signing_token', token)
+    .eq('signing_token', parsed.data.token)
     .single()
 
   if (!signer || signer.viewed_at) return
@@ -43,7 +61,7 @@ export async function markSignerViewed(token: string) {
       ip_address: headersList.get('x-forwarded-for') ?? headersList.get('x-real-ip'),
       user_agent: headersList.get('user-agent'),
     })
-    .eq('signing_token', token)
+    .eq('signing_token', parsed.data.token)
 
   await supabase.from('audit_events').insert({
     envelope_id: signer.envelope_id,
@@ -55,16 +73,22 @@ export async function markSignerViewed(token: string) {
 }
 
 export async function submitSignature(formData: FormData) {
+  const parsed = submitSignatureSchema.safeParse({
+    token: formData.get('token'),
+    signature_data: formData.get('signature_data'),
+  })
+
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0].message }
+  }
+
   const supabase = await createAdminClient()
   const headersList = await headers()
-
-  const token = formData.get('token') as string
-  const signatureData = formData.get('signature_data') as string
 
   const { data: signer } = await supabase
     .from('signers')
     .select('id, envelope_id, status, token_expires_at')
-    .eq('signing_token', token)
+    .eq('signing_token', parsed.data.token)
     .single()
 
   if (!signer) {
@@ -85,6 +109,7 @@ export async function submitSignature(formData: FormData) {
 
   const ipAddress = headersList.get('x-forwarded-for') ?? headersList.get('x-real-ip')
   const userAgent = headersList.get('user-agent')
+  const signatureData = parsed.data.signature_data
 
   // Save signature image to storage
   let signatureUrl: string | null = null
@@ -179,18 +204,24 @@ export async function submitSignature(formData: FormData) {
     }
   }
 
-  revalidatePath(`/sign/${token}`)
+  revalidatePath(`/sign/${parsed.data.token}`)
   return { success: true }
 }
 
 export async function declineSigning(token: string, reason: string) {
+  const parsed = declineSigningSchema.safeParse({ token, reason })
+
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0].message }
+  }
+
   const supabase = await createAdminClient()
   const headersList = await headers()
 
   const { data: signer } = await supabase
     .from('signers')
     .select('id, envelope_id')
-    .eq('signing_token', token)
+    .eq('signing_token', parsed.data.token)
     .single()
 
   if (!signer) {
@@ -202,9 +233,9 @@ export async function declineSigning(token: string, reason: string) {
     .update({
       status: 'declined',
       declined_at: new Date().toISOString(),
-      decline_reason: reason,
+      decline_reason: parsed.data.reason,
     })
-    .eq('signing_token', token)
+    .eq('signing_token', parsed.data.token)
 
   await supabase
     .from('envelopes')
@@ -217,9 +248,9 @@ export async function declineSigning(token: string, reason: string) {
     event_type: 'signer_declined',
     ip_address: headersList.get('x-forwarded-for'),
     user_agent: headersList.get('user-agent'),
-    metadata: { reason },
+    metadata: { reason: parsed.data.reason },
   })
 
-  revalidatePath(`/sign/${token}`)
+  revalidatePath(`/sign/${parsed.data.token}`)
   return { success: true }
 }
